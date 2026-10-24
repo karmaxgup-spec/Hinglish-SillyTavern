@@ -200,26 +200,33 @@ async function processMessage(messageId) {
 
 async function init() {
     const s = settings();
-    const html = await $.get(`${EXT_FOLDER}/settings.html`);
-    const target = $('#extensions_settings2').length ? '#extensions_settings2' : '#extensions_settings';
-    $(target).append(html);
 
-    $('#hinglish_enabled').prop('checked', s.enabled).on('change', function () {
-        s.enabled = this.checked;
-        saveSettingsDebounced();
-    });
-    $('#hinglish_ratio').val(s.hindiRatio).on('input', function () {
-        s.hindiRatio = Number(this.value);
-        $('#hinglish_ratio_label').text(this.value);
-        saveSettingsDebounced();
-    });
-    $('#hinglish_ratio_label').text(s.hindiRatio);
-    $('#hinglish_skip_actions').prop('checked', s.skipActions).on('change', function () {
-        s.skipActions = this.checked;
-        saveSettingsDebounced();
-    });
-
+    // Register the translation hook first, so translation works even if the settings panel fails.
     eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, id => processMessage(id));
+
+    try {
+        const { renderExtensionTemplateAsync } = SillyTavern.getContext();
+        const html = await renderExtensionTemplateAsync('third-party/st-hinglish', 'settings');
+        const target = $('#extensions_settings2').length ? '#extensions_settings2' : '#extensions_settings';
+        $(target).append(html);
+
+        $('#hinglish_enabled').prop('checked', s.enabled).on('change', function () {
+            s.enabled = this.checked;
+            saveSettingsDebounced();
+        });
+        $('#hinglish_ratio').val(s.hindiRatio).on('input', function () {
+            s.hindiRatio = Number(this.value);
+            $('#hinglish_ratio_label').text(this.value);
+            saveSettingsDebounced();
+        });
+        $('#hinglish_ratio_label').text(s.hindiRatio);
+        $('#hinglish_skip_actions').prop('checked', s.skipActions).on('change', function () {
+            s.skipActions = this.checked;
+            saveSettingsDebounced();
+        });
+    } catch (err) {
+        console.warn('[Hinglish Mode] settings panel not loaded, translation still active:', err);
+    }
 }
 
 $(function () {
