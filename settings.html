@@ -1,0 +1,24 @@
+<div class="hinglish-settings inline-drawer">
+    <div class="inline-drawer-toggle inline-drawer-header">
+        <b>Hinglish Mode</b>
+        <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+    </div>
+    <div class="inline-drawer-content">
+        <label class="checkbox_label">
+            <input id="hinglish_enabled" type="checkbox" />
+            <span>Enable Hinglish display</span>
+        </label>
+        <label>
+            Share of sentences in Hindi: <span id="hinglish_ratio_label"></span>%
+        </label>
+        <input id="hinglish_ratio" type="range" min="0" max="100" step="5" style="width:100%;" />
+        <label class="checkbox_label">
+            <input id="hinglish_skip_actions" type="checkbox" />
+            <span>Leave *action* text in English</span>
+        </label>
+        <small>
+            Only the displayed text changes. Saved messages and the context sent to the model stay in English.
+            Uses Google Translate, so message text is sent to Google.
+        </small>
+    </div>
+</div>
