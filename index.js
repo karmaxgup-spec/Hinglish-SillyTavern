@@ -2,11 +2,10 @@ import { extension_settings, saveSettingsDebounced } from '../../../extensions.j
 import { eventSource, event_types } from '../../../../script.js';
 
 const MODULE = 'hinglish_mode';
-const EXT_FOLDER = 'scripts/extensions/third-party/st-hinglish';
 
 const DEFAULTS = {
     enabled: true,
-    hindiRatio: 60,      // % of sentences shown in Hindi (rest stay English)
+    hindiRatio: 60,      // % of a message's sentences converted to Hinglish
     skipActions: false,  // leave *action text* in English
 };
 
@@ -46,7 +45,7 @@ const NUKTA = '़';
 
 function devanagariWordToRoman(word) {
     const chars = [...word];
-    const pieces = []; // { t, inherent } — inherent means a silent-able "a" follows
+    const pieces = []; // { t, inherent }: inherent = a vowel "a" that is dropped at the end of a word
     for (let i = 0; i < chars.length; i++) {
         const c = chars[i];
         if (CONS[c] !== undefined) {
@@ -90,6 +89,43 @@ function devanagariToRoman(text) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Formal Hindi (Google's "aap" forms) -> informal Hinglish ("tu")      */
+/* ------------------------------------------------------------------ */
+
+const INFORMAL = [
+    [/\baapko\b/gi, 'tujhe'],
+    [/\baapka\b/gi, 'tera'],
+    [/\baapki\b/gi, 'teri'],
+    [/\baapke\b/gi, 'tere'],
+    [/\baapne\b/gi, 'tune'],
+    [/\baapse\b/gi, 'tujhse'],
+    [/\baap\b/gi, 'tu'],
+    [/\bkaise\b/gi, 'kaisa'],
+    [/\bhain\b/gi, 'hai'],
+    [/\brahe\b/gi, 'raha'],
+    [/\brahi\b/gi, 'rahi'],
+    [/\bbataiye\b/gi, 'bata'],
+    [/\bbatayein\b/gi, 'bata'],
+    [/\bkijiye\b/gi, 'kar'],
+    [/\bkariye\b/gi, 'kar'],
+    [/\bdijiye\b/gi, 'de'],
+    [/\blijiye\b/gi, 'le'],
+    [/\bjaiye\b/gi, 'ja'],
+    [/\baaiye\b/gi, 'aa'],
+];
+
+// Keep a capital letter if the original word had one ("Aap" -> "Tu").
+function matchCase(src, rep) {
+    return /^[A-Z]/.test(src) ? rep[0].toUpperCase() + rep.slice(1) : rep;
+}
+
+function toInformal(text) {
+    let out = text;
+    for (const [re, rep] of INFORMAL) out = out.replace(re, m => matchCase(m, rep));
+    return out;
+}
+
+/* ------------------------------------------------------------------ */
 /* Google Translate (English -> Hindi, Devanagari)                     */
 /* ------------------------------------------------------------------ */
 
@@ -123,27 +159,69 @@ async function translateBatch(texts) {
 
 const translationCache = new Map(); // English sentence -> Hinglish sentence
 
-// Stable 0-99 number from a string, so the same sentence gets the same decision on every re-render.
-function stableBucket(str) {
-    let h = 5381;
-    for (const ch of str) h = ((h << 5) + h + ch.charCodeAt(0)) | 0;
-    return (h >>> 0) % 100;
+function hashString(str) {
+    let h = 2166136261;
+    for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+    }
+    return h >>> 0;
+}
+
+// Small seeded random generator, so the same message always picks the same sentences.
+function seededRandom(seed) {
+    let a = seed;
+    return function () {
+        a |= 0;
+        a = (a + 0x6D2B79F5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+// Pick exactly round(count * ratio) indices out of count, at random.
+// 10 sentences at 60% -> 6 converted. 3 sentences -> 2 converted.
+function pickIndices(count, ratio, seedText) {
+    const k = Math.round(count * ratio / 100);
+    const rng = seededRandom(hashString(seedText));
+    const idx = [...Array(count).keys()];
+    for (let i = idx.length - 1; i > 0; i--) {
+        const j = Math.floor(rng() * (i + 1));
+        [idx[i], idx[j]] = [idx[j], idx[i]];
+    }
+    return new Set(idx.slice(0, k));
 }
 
 function splitSentences(text) {
     return text.match(/[^.!?\n]+[.!?]*\s*|[.!?\n]+/g) || [];
 }
 
-function shouldConvert(core, s) {
-    if (!/[A-Za-z]{2,}/.test(core)) return false;      // nothing to translate
-    if (/https?:\/\/|[`<>{}\[\]|]/.test(core)) return false; // links, code, markup
-    if (core.split(/\s+/).length < 2) return false;     // lone words read oddly when swapped
-    return stableBucket(core) < s.hindiRatio;
+// A sentence can be converted if it has at least two real words and no links, code or markup.
+function isConvertible(core) {
+    if (!/[A-Za-z]{2,}/.test(core)) return false;
+    if (/https?:\/\/|[`<>{}\[\]|]/.test(core)) return false;
+    if (core.split(/\s+/).length < 2) return false;
+    return true;
 }
 
 /* ------------------------------------------------------------------ */
 /* Applying it to a rendered message                                    */
 /* ------------------------------------------------------------------ */
+
+function collectTextNodes(el, s) {
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    while (walker.nextNode()) {
+        const node = walker.currentNode;
+        const parent = node.parentElement;
+        if (!parent || !node.nodeValue.trim()) continue;
+        if (parent.closest('code, pre')) continue;
+        if (s.skipActions && parent.closest('em, i')) continue;
+        nodes.push(node);
+    }
+    return nodes;
+}
 
 async function processMessage(messageId) {
     const s = settings();
@@ -155,24 +233,22 @@ async function processMessage(messageId) {
     if (!el || el.dataset.hinglish === '1') return;
 
     try {
-        const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
-        const nodes = [];
-        while (walker.nextNode()) {
-            const node = walker.currentNode;
-            const parent = node.parentElement;
-            if (!parent || !node.nodeValue.trim()) continue;
-            if (parent.closest('code, pre')) continue;
-            if (s.skipActions && parent.closest('em, i')) continue;
-            nodes.push(node);
-        }
+        const nodes = collectTextNodes(el, s);
+        const seedText = nodes.map(n => n.nodeValue).join('\u0000');
 
+        // Split every text node into sentences, noting which ones can be converted.
         const plan = nodes.map(node => ({
             node,
             sentences: splitSentences(node.nodeValue).map(sent => {
                 const m = sent.match(/^(\s*)([\s\S]*?)(\s*)$/);
-                return { lead: m[1], core: m[2], trail: m[3], convert: shouldConvert(m[2], s) };
+                return { lead: m[1], core: m[2], trail: m[3], convertible: isConvertible(m[2]), convert: false };
             }),
         }));
+
+        // Choose the exact share of this message's convertible sentences.
+        const convertible = plan.flatMap(p => p.sentences.filter(x => x.convertible));
+        const chosen = pickIndices(convertible.length, s.hindiRatio, seedText);
+        convertible.forEach((x, i) => { x.convert = chosen.has(i); });
 
         const missing = [...new Set(
             plan.flatMap(p => p.sentences.filter(x => x.convert && !translationCache.has(x.core)).map(x => x.core))
@@ -180,7 +256,7 @@ async function processMessage(messageId) {
 
         if (missing.length) {
             const hindi = await translateBatch(missing);
-            missing.forEach((eng, i) => translationCache.set(eng, devanagariToRoman(hindi[i])));
+            missing.forEach((eng, i) => translationCache.set(eng, toInformal(devanagariToRoman(hindi[i]))));
         }
 
         for (const p of plan) {
@@ -201,12 +277,45 @@ async function processMessage(messageId) {
 async function init() {
     const s = settings();
 
-    // Register the translation hook first, so translation works even if the settings panel fails.
+    // New model replies get converted as they render.
     eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, id => processMessage(id));
 
+    // When a chat is opened, convert the model messages already on screen.
+    eventSource.on(event_types.CHAT_CHANGED, () => {
+        setTimeout(async () => {
+            for (const mes of document.querySelectorAll('#chat .mes[is_user="false"]')) {
+                await processMessage(mes.getAttribute('mesid'));
+            }
+        }, 500);
+    });
+
     try {
-        const { renderExtensionTemplateAsync } = SillyTavern.getContext();
-        const html = await renderExtensionTemplateAsync('third-party/st-hinglish', 'settings');
+        const html = `
+<div class="hinglish-settings inline-drawer">
+    <div class="inline-drawer-toggle inline-drawer-header">
+        <b>Hinglish Mode</b>
+        <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+    </div>
+    <div class="inline-drawer-content">
+        <label class="checkbox_label">
+            <input id="hinglish_enabled" type="checkbox" />
+            <span>Enable Hinglish display</span>
+        </label>
+        <label>
+            Share of sentences in Hindi: <span id="hinglish_ratio_label"></span>%
+        </label>
+        <input id="hinglish_ratio" type="range" min="0" max="100" step="5" style="width:100%;" />
+        <label class="checkbox_label">
+            <input id="hinglish_skip_actions" type="checkbox" />
+            <span>Leave *action* text in English</span>
+        </label>
+        <small>
+            Only the displayed text changes. Saved messages and the context sent to the model stay in English.
+            Uses Google Translate, so message text is sent to Google.
+            The share change applies to messages rendered after you change it.
+        </small>
+    </div>
+</div>`;
         const target = $('#extensions_settings2').length ? '#extensions_settings2' : '#extensions_settings';
         $(target).append(html);
 
