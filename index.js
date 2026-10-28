@@ -1,16 +1,12 @@
 // Google Translate (Payload to English) for SillyTavern
 //
-// Translates chat history right before a generation request is built, so the
-// model and every other extension see English. The chat on screen, the saved
-// chat file and the stored messages are never changed.
+// Translates chat history in the actual request body right before it is sent
+// to the API. The chat on screen, the saved chat file and the stored messages
+// are never changed. Only the copy of the request that goes over the network
+// is rewritten.
 //
-// SillyTavern calls window.gtPayloadInterceptor(chat, contextSize, abort, type)
-// before building the prompt. The `chat` array can have three shapes:
-//   - Chat Completion APIs: objects like { role: 'user'|'assistant'|'system', content: string | parts[] }
-//   - Text Completion APIs: plain strings
-//   - Internal message objects: { mes: string, is_user: boolean, is_system: boolean }
-// We handle all three. We replace entries in the array with translated copies
-// and never mutate the original objects.
+// It wraps window.fetch and, for chat completion requests, parses the JSON body,
+// translates the non-system messages, and sends the modified body on.
 
 import { extension_settings } from '../../../extensions.js';
 
@@ -140,7 +136,7 @@ async function translate(text, target) {
     return result;
 }
 
-// Translate, but fall back to the original text on any error so generation still works.
+// Translate, but fall back to the original on any error so generation still works.
 async function safeTranslate(text, target) {
     try {
         return await translate(text, target);
@@ -150,7 +146,7 @@ async function safeTranslate(text, target) {
     }
 }
 
-// ---------- payload interceptor ----------
+// ---------- request body rewriting ----------
 
 async function runPool(tasks, n) {
     let next = 0;
@@ -163,81 +159,70 @@ async function runPool(tasks, n) {
     await Promise.all(workers);
 }
 
-// Called by SillyTavern before the prompt is built. Mutates the `chat` array
-// in place, replacing entries with translated copies.
-window.gtPayloadInterceptor = async function (chat, contextSize, abort, type) {
+// Translates the messages array of a chat completion request body in place.
+// `body` is our own parsed copy of the request, so this does not touch the chat.
+async function translateBodyMessages(body) {
     const s = settings();
-    if (!s.enabled || !Array.isArray(chat)) return;
-
-    const target = s.targetLang;
+    const messages = body.messages;
     const tasks = [];
     let queued = 0;
 
-    for (let i = 0; i < chat.length; i++) {
-        const item = chat[i];
+    messages.forEach((m, i) => {
+        if (!m || typeof m !== 'object') return;
+        if (m.role === 'system') return;
+        const isUser = m.role === 'user';
+        if (isUser ? !s.translateUser : !s.translateAssistant) return;
 
-        // Text Completion: plain strings. Role is unknown, so translate if either side is enabled.
-        if (typeof item === 'string') {
-            if (!item.trim() || !(s.translateUser || s.translateAssistant)) continue;
+        if (typeof m.content === 'string') {
+            if (!m.content.trim()) return;
             queued++;
             tasks.push(async () => {
-                chat[i] = await safeTranslate(item, target);
+                messages[i].content = await safeTranslate(m.content, s.targetLang);
             });
-            continue;
-        }
-
-        if (!item || typeof item !== 'object') continue;
-        if (item.role === 'system' || item.is_system) continue;
-
-        const isUser = item.role === 'user' || item.is_user === true;
-        if (isUser ? !s.translateUser : !s.translateAssistant) continue;
-
-        // Chat Completion: content is a string.
-        if (typeof item.content === 'string') {
-            if (!item.content.trim()) continue;
-            queued++;
-            tasks.push(async () => {
-                chat[i] = { ...chat[i], content: await safeTranslate(chat[i].content, target) };
-            });
-            continue;
-        }
-
-        // Chat Completion: content is an array of parts (text, images, ...). Translate text parts only.
-        if (Array.isArray(item.content)) {
-            const textIdx = [];
-            item.content.forEach((p, pi) => {
-                if (p && p.type === 'text' && typeof p.text === 'string' && p.text.trim()) textIdx.push(pi);
-            });
-            if (!textIdx.length) continue;
-            queued += textIdx.length;
-            tasks.push(async () => {
-                const parts = [...chat[i].content];
-                for (const pi of textIdx) {
-                    parts[pi] = { ...parts[pi], text: await safeTranslate(parts[pi].text, target) };
+        } else if (Array.isArray(m.content)) {
+            m.content.forEach((part, pi) => {
+                if (part && part.type === 'text' && typeof part.text === 'string' && part.text.trim()) {
+                    queued++;
+                    tasks.push(async () => {
+                        messages[i].content[pi].text = await safeTranslate(part.text, s.targetLang);
+                    });
                 }
-                chat[i] = { ...chat[i], content: parts };
-            });
-            continue;
-        }
-
-        // Internal message objects.
-        if (typeof item.mes === 'string') {
-            if (!item.mes.trim()) continue;
-            queued++;
-            tasks.push(async () => {
-                chat[i] = { ...chat[i], mes: await safeTranslate(chat[i].mes, target) };
             });
         }
-    }
+    });
 
-    console.log(`[GT payload] ${queued} message segment(s) queued for translation to "${target}" (type: ${type})`);
-    if (!queued) {
-        console.warn('[GT payload] nothing matched. Check the chat payload shape or the user/assistant toggles.');
-        return;
-    }
+    console.log(`[GT payload] ${queued} message segment(s) queued for translation to "${s.targetLang}"`);
+    if (!queued) return false;
 
     await runPool(tasks, s.concurrency);
-    console.log('[GT payload] done');
+    return true;
+}
+
+function isChatCompletionUrl(url) {
+    return url.includes('/chat-completions/generate') || url.includes('/chat/completions');
+}
+
+// Wrap fetch so chat completion requests carry translated messages.
+const originalFetch = window.fetch.bind(window);
+
+window.fetch = async function (input, init) {
+    try {
+        const url = typeof input === 'string' ? input : (input && input.url) || '';
+        const s = settings();
+        if (s.enabled && init && typeof init.body === 'string' && isChatCompletionUrl(url)) {
+            const body = JSON.parse(init.body);
+            if (body && Array.isArray(body.messages)) {
+                const changed = await translateBodyMessages(body);
+                if (changed) {
+                    init = { ...init, body: JSON.stringify(body) };
+                    console.log('[GT payload] request body rewritten with translated messages');
+                }
+            }
+        }
+    } catch (err) {
+        console.warn('[GT payload] could not rewrite request, sending original:', err);
+    }
+    return originalFetch(input, init);
 };
 
 // ---------- settings panel ----------
@@ -267,7 +252,7 @@ function buildSettingsPanel() {
     <div class="flex-container">
       <button id="gtp_clear" class="menu_button">Clear translation cache</button>
     </div>
-    <small>Changes only the prompt sent to the model. The chat on screen and saved chats keep their original text.</small>
+    <small>Changes only the request sent to the model. The chat on screen and saved chats keep their original text.</small>
   </div>
 </div>`;
 
