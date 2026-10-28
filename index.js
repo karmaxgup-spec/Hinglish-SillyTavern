@@ -1,6 +1,10 @@
+import { eventSource, event_types } from '../../../../script.js';
+import { getContext } from '../../../extensions.js';
+
 const MODULE = 'st_outgoing_translate';
-const TARGET_LANG = 'en';   // change to your target language
+const TARGET_LANG = 'en';
 const SOURCE_LANG = 'auto';
+const EXTRA_KEY = 'outgoing_translation';
 
 const cache = new Map();
 
@@ -18,22 +22,30 @@ async function translateText(text) {
         cache.set(key, translated);
         return translated;
     } catch (err) {
-        console.error(`[${MODULE}] translation failed, sending original`, err);
-        return text; // fall back to the original message
+        console.error(`[${MODULE}] translation failed, using original`, err);
+        return text;
     }
 }
 
-// Called by SillyTavern right before the prompt is built.
-// `chat` is the array of messages going into the payload.
+// Translate the user's message as soon as it's sent. The result is stored in
+// msg.extra, never in msg.mes, so the displayed text is never changed.
+eventSource.on(event_types.MESSAGE_SENT, async (index) => {
+    const { chat } = getContext();
+    const msg = chat[index];
+    if (!msg || !msg.is_user) return;
+    msg.extra = msg.extra || {};
+    msg.extra[EXTRA_KEY] = await translateText(msg.mes);
+});
+
+// Runs right before the prompt is built. Swaps in the translation on copies only.
 globalThis.outgoingTranslateInterceptor = async function (chat, contextSize, abort, type) {
-    // Only translate the most recent user message that's in the payload.
-    // Translating every user message on every generation would be slow and wasteful.
     for (let i = chat.length - 1; i >= 0; i--) {
         const msg = chat[i];
-        if (msg && msg.is_user) {
-            // Replace the entry with a copy so the on-screen message object is untouched.
-            chat[i] = { ...msg, mes: await translateText(msg.mes) };
-            break;
-        }
+        if (!msg || !msg.is_user) continue;
+
+        // Use the stored translation if it exists, otherwise translate now.
+        const translated = msg.extra?.[EXTRA_KEY] ?? await translateText(msg.mes);
+        chat[i] = { ...msg, mes: translated };
+        break;
     }
 };
