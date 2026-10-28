@@ -7,6 +7,13 @@
 //
 // It wraps window.fetch and, for chat completion requests, parses the JSON body,
 // translates the non-system messages, and sends the modified body on.
+//
+// Accuracy changes in this version:
+//   - Each message is sent whole (one request per message), not cut into
+//     900-character pieces. Long messages are only split if they exceed MAX_CHUNK,
+//     and then only at paragraph or sentence boundaries.
+//   - Requests use POST, so long non-Latin text no longer breaks the URL length.
+//   - Line breaks are kept, so paragraph structure survives translation.
 
 import { extension_settings } from '../../../extensions.js';
 
@@ -29,7 +36,7 @@ const LANGUAGES = [
     ['bn', 'Bengali'], ['ta', 'Tamil'], ['te', 'Telugu'], ['ur', 'Urdu'],
 ];
 
-const MAX_CHUNK = 900;   // characters per Google request
+const MAX_CHUNK = 4500;  // characters per request; most messages fit in one
 const MAX_CACHE = 5000;  // persisted translation entries
 
 // ---------- settings ----------
@@ -86,26 +93,42 @@ function clearCache() {
 
 // ---------- Google Translate (unofficial gtx endpoint, no API key) ----------
 
+// Splits only when a message is longer than MAX_CHUNK. Prefers paragraph breaks,
+// then line breaks, then sentence ends, so each piece stays a coherent unit.
+// Each piece keeps its trailing separator so joining the results restores the text.
 function splitForGoogle(text) {
+    if (text.length <= MAX_CHUNK) return [text];
+
     const parts = [];
     let rest = text;
     while (rest.length > MAX_CHUNK) {
-        let cut = rest.lastIndexOf('\n', MAX_CHUNK);
-        if (cut < MAX_CHUNK / 2) cut = rest.lastIndexOf(' ', MAX_CHUNK);
+        const window = rest.slice(0, MAX_CHUNK);
+        let cut = window.lastIndexOf('\n\n');
+        if (cut < MAX_CHUNK / 2) cut = window.lastIndexOf('\n');
+        if (cut < MAX_CHUNK / 2) {
+            const sentenceEnd = Math.max(window.lastIndexOf('. '), window.lastIndexOf('! '), window.lastIndexOf('? '));
+            if (sentenceEnd > 0) cut = sentenceEnd + 1;
+        }
+        if (cut < MAX_CHUNK / 2) cut = window.lastIndexOf(' ');
         if (cut < 1) cut = MAX_CHUNK;
-        parts.push(rest.slice(0, cut));
-        rest = rest.slice(cut);
+        // Keep the separator at the end of this piece.
+        const end = (window[cut] === '\n' || window[cut] === ' ') ? cut + 1 : cut + 1;
+        parts.push(rest.slice(0, end));
+        rest = rest.slice(end);
     }
     parts.push(rest);
     return parts;
 }
 
 async function translateChunk(text, target) {
-    const url = 'https://translate.googleapis.com/translate_a/single'
-        + '?client=gtx&sl=auto&dt=t'
-        + '&tl=' + encodeURIComponent(target)
-        + '&q=' + encodeURIComponent(text);
-    const res = await fetch(url);
+    // POST keeps long text out of the URL, so non-Latin scripts don't hit URL length limits.
+    const url = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&dt=t'
+        + '&tl=' + encodeURIComponent(target);
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+        body: 'q=' + encodeURIComponent(text),
+    });
     if (!res.ok) throw new Error(`Google Translate HTTP ${res.status}`);
     const data = await res.json();
     return {
