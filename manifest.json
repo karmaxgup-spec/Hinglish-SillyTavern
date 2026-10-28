@@ -1,8 +1,10 @@
 {
-  "display_name": "Outgoing Translate",
+  "display_name": "Built-in Translate (Payload Only)",
   "loading_order": 10,
   "requires": [],
-  "version": "0.1.0",
-  "author": "you",
-  "generate_interceptor": "outgoingTranslateInterceptor"
+  "version": "1.0.0",
+  "author": "",
+  "js": "index.js",
+  "css": "",
+  "minimum_client_version": "1.12.0"
 }
