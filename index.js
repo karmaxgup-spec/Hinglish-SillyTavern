@@ -1,22 +1,26 @@
-// Google Translate (Display Only) for SillyTavern
+// Google Translate (Payload to English) for SillyTavern
 //
-// Translates the text shown in chat bubbles (user and assistant) using Google
-// Translate. It only swaps the text inside existing text nodes:
-//   - no classes, styles, layout or markup are added or changed
-//   - code blocks and reasoning blocks are left alone
-//   - the stored chat, prompts and saved files are never modified
-// Turning the extension off restores the original text.
+// Translates chat history right before a generation request is built, so the
+// model and every other extension see English. The chat on screen, the saved
+// chat file and the stored messages are never changed.
+//
+// How it works:
+//   manifest.json -> "generate_interceptor": "gtPayloadInterceptor"
+//   SillyTavern calls window.gtPayloadInterceptor(chat, contextSize, abort, type)
+//   before building the prompt. We replace the message objects in that array
+//   with translated copies. We never mutate the original objects.
 
-import { eventSource, event_types } from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
 
-const MODULE = 'st_gtranslate_display';
+const MODULE = 'st_gtranslate_payload';
+const CACHE_KEY = 'st_gtranslate_payload_cache';
 
 const DEFAULTS = {
     enabled: true,
-    targetLang: 'hi',
+    targetLang: 'en',
     translateUser: true,
     translateAssistant: true,
+    concurrency: 4,
 };
 
 const LANGUAGES = [
@@ -27,12 +31,10 @@ const LANGUAGES = [
     ['bn', 'Bengali'], ['ta', 'Tamil'], ['te', 'Telugu'], ['ur', 'Urdu'],
 ];
 
-const MAX_CHUNK = 900; // characters per Google request (keeps the URL short)
-const SKIP_SELECTOR = 'code, pre, script, style, .mes_reasoning, .mes_reasoning_details';
+const MAX_CHUNK = 900;     // characters per Google request
+const MAX_CACHE = 5000;    // persisted translation entries
 
-// Original text of every node we have changed. WeakMap, so detached nodes are freed.
-const originals = new WeakMap();
-const cache = new Map();
+// ---------- settings ----------
 
 function settings() {
     if (!extension_settings[MODULE]) {
@@ -46,10 +48,43 @@ function settings() {
     return extension_settings[MODULE];
 }
 
-function save() {
+function saveSettings() {
     if (typeof window.saveSettingsDebounced === 'function') {
         window.saveSettingsDebounced();
     }
+}
+
+// ---------- persistent cache (so restarts do not re-translate old history) ----------
+
+const cache = new Map();
+
+function loadCache() {
+    try {
+        const raw = localStorage.getItem(CACHE_KEY);
+        if (!raw) return;
+        for (const [k, v] of Object.entries(JSON.parse(raw))) cache.set(k, v);
+    } catch (e) {
+        console.warn('[GT payload] could not load cache', e);
+    }
+}
+
+let saveTimer = null;
+function scheduleCacheSave() {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+        try {
+            // keep only the newest MAX_CACHE entries (Map keeps insertion order)
+            const entries = [...cache.entries()].slice(-MAX_CACHE);
+            localStorage.setItem(CACHE_KEY, JSON.stringify(Object.fromEntries(entries)));
+        } catch (e) {
+            console.warn('[GT payload] could not save cache', e);
+        }
+    }, 500);
+}
+
+function clearCache() {
+    cache.clear();
+    localStorage.removeItem(CACHE_KEY);
 }
 
 // ---------- Google Translate (unofficial gtx endpoint, no API key) ----------
@@ -76,111 +111,83 @@ async function translateChunk(text, target) {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`Google Translate HTTP ${res.status}`);
     const data = await res.json();
-    return data[0].map(seg => seg[0]).join('');
+    return {
+        text: data[0].map(seg => seg[0]).join(''),
+        src: data[2], // detected source language
+    };
 }
 
+// Returns the translated text, or the original if it is already in the target language.
 async function translate(text, target) {
     const key = target + '\u0000' + text;
     if (cache.has(key)) return cache.get(key);
 
     const pieces = splitForGoogle(text);
     const out = [];
+    let detected = null;
     for (const p of pieces) {
-        out.push(await translateChunk(p, target));
+        const r = await translateChunk(p, target);
+        detected = detected || r.src;
+        out.push(r.text);
     }
-    const result = out.join('');
+
+    const sameLanguage = detected && detected.toLowerCase().split('-')[0] === target.toLowerCase().split('-')[0];
+    const result = sameLanguage ? text : out.join('');
+
     cache.set(key, result);
-    if (cache.size > 2000) cache.delete(cache.keys().next().value);
+    scheduleCacheSave();
     return result;
 }
 
-// ---------- DOM work: text nodes only ----------
+// ---------- payload interceptor ----------
 
-function textNodesIn(root, filterSkips = true) {
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-        acceptNode(node) {
-            if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
-            if (filterSkips && node.parentElement && node.parentElement.closest(SKIP_SELECTOR)) {
-                return NodeFilter.FILTER_REJECT;
-            }
-            return NodeFilter.FILTER_ACCEPT;
-        },
-    });
-    const nodes = [];
-    let n;
-    while ((n = walker.nextNode())) nodes.push(n);
-    return nodes;
-}
-
-function splitWhitespace(s) {
-    const lead = s.match(/^\s*/)[0];
-    const trail = s.match(/\s*$/)[0];
-    return { lead, core: s.trim(), trail };
-}
-
-async function translateNode(node, target) {
-    const current = node.nodeValue;
-    const { lead, core, trail } = splitWhitespace(current);
-    if (!core) return;
-
-    // Always translate from the original text, so repeated runs do not stack.
-    const source = originals.has(node) ? originals.get(node) : current;
-    const parts = splitWhitespace(source);
-    if (!originals.has(node)) originals.set(node, current);
-
-    const translated = await translate(parts.core, target);
-    if (!node.isConnected) return; // message was re-rendered meanwhile
-    node.nodeValue = parts.lead + translated + parts.trail;
-}
-
-function shouldTranslateMessage(mesEl) {
-    const s = settings();
-    if (!s.enabled) return false;
-    const isUser = mesEl.getAttribute('is_user') === 'true';
-    return isUser ? s.translateUser : s.translateAssistant;
-}
-
-async function translateMessageEl(mesEl) {
-    if (!mesEl) return;
-    const textEl = mesEl.querySelector('.mes_text');
-    if (!textEl) return;
-    if (!shouldTranslateMessage(mesEl)) {
-        restoreIn(textEl);
-        return;
-    }
-    const target = settings().targetLang;
-    const nodes = textNodesIn(textEl);
-    await Promise.all(nodes.map(n => translateNode(n, target).catch(err => {
-        console.warn('[GT display] translate failed:', err);
-    })));
-}
-
-function restoreIn(root) {
-    for (const node of textNodesIn(root, false)) {
-        if (originals.has(node)) {
-            node.nodeValue = originals.get(node);
-            originals.delete(node);
+async function runPool(tasks, n) {
+    let next = 0;
+    const workers = Array.from({ length: Math.max(1, n) }, async () => {
+        while (next < tasks.length) {
+            const task = tasks[next++];
+            await task();
         }
+    });
+    await Promise.all(workers);
+}
+
+// Called by SillyTavern before the prompt is built.
+window.gtPayloadInterceptor = async function (chat, contextSize, abort, type) {
+    const s = settings();
+    if (!s.enabled || !Array.isArray(chat)) return;
+
+    const tasks = [];
+    for (let i = 0; i < chat.length; i++) {
+        const item = chat[i];
+        if (!item || typeof item !== 'object') continue;
+        if (item.is_system) continue;
+
+        const isUser = !!item.is_user;
+        if (isUser && !s.translateUser) continue;
+        if (!isUser && !s.translateAssistant) continue;
+
+        const field = typeof item.mes === 'string' ? 'mes'
+            : (typeof item.content === 'string' ? 'content' : null);
+        if (!field || !item[field].trim()) continue;
+
+        tasks.push(async () => {
+            try {
+                const translated = await translate(item[field], s.targetLang);
+                // Replace the entry with a copy. The original message object
+                // (the one stored in the chat) is left untouched.
+                chat[i] = { ...chat[i], [field]: translated };
+            } catch (err) {
+                // On failure keep the original text so generation still works.
+                console.warn('[GT payload] translation failed, using original:', err);
+            }
+        });
     }
-}
 
-async function translateById(mesId) {
-    const el = document.querySelector(`#chat .mes[mesid="${mesId}"]`);
-    await translateMessageEl(el);
-}
+    await runPool(tasks, s.concurrency);
+};
 
-async function translateAll() {
-    const els = document.querySelectorAll('#chat .mes');
-    for (const el of els) {
-        await translateMessageEl(el);
-    }
-}
-
-function restoreAll() {
-    document.querySelectorAll('#chat .mes .mes_text').forEach(restoreIn);
-}
-
-// ---------- Settings panel ----------
+// ---------- settings panel ----------
 
 function buildSettingsPanel() {
     const s = settings();
@@ -189,19 +196,25 @@ function buildSettingsPanel() {
         .join('');
 
     const html = `
-<div class="st-gtdisplay inline-drawer">
+<div class="st-gtpayload inline-drawer">
   <div class="inline-drawer-toggle inline-drawer-header">
-    <b>Google Translate (Display Only)</b>
+    <b>Google Translate (Payload)</b>
     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
   </div>
   <div class="inline-drawer-content">
-    <label class="checkbox_label"><input type="checkbox" id="gtd_enabled"> Enabled</label>
-    <label class="checkbox_label"><input type="checkbox" id="gtd_user"> Translate my messages</label>
-    <label class="checkbox_label"><input type="checkbox" id="gtd_assistant"> Translate assistant messages</label>
-    <label>Target language
-      <select id="gtd_lang" class="text_pole">${langOptions}</select>
+    <label class="checkbox_label"><input type="checkbox" id="gtp_enabled"> Enabled</label>
+    <label class="checkbox_label"><input type="checkbox" id="gtp_user"> Translate my messages</label>
+    <label class="checkbox_label"><input type="checkbox" id="gtp_assistant"> Translate assistant messages</label>
+    <label>Send to model in
+      <select id="gtp_lang" class="text_pole">${langOptions}</select>
     </label>
-    <small>Changes only what is displayed. Saved chat and prompts stay in the original language.</small>
+    <label>Parallel requests
+      <input type="number" id="gtp_conc" class="text_pole" min="1" max="10" value="${s.concurrency}">
+    </label>
+    <div class="flex-container">
+      <button id="gtp_clear" class="menu_button">Clear translation cache</button>
+    </div>
+    <small>Changes only the prompt sent to the model. The chat on screen and saved chats keep their original text.</small>
   </div>
 </div>`;
 
@@ -209,39 +222,31 @@ function buildSettingsPanel() {
     container.insertAdjacentHTML('beforeend', html);
 
     const $ = window.jQuery;
-    $('#gtd_enabled').prop('checked', s.enabled).on('change', function () {
-        s.enabled = this.checked; save();
-        if (s.enabled) translateAll(); else restoreAll();
+    $('#gtp_enabled').prop('checked', s.enabled).on('change', function () {
+        s.enabled = this.checked; saveSettings();
     });
-    $('#gtd_user').prop('checked', s.translateUser).on('change', function () {
-        s.translateUser = this.checked; save();
-        if (s.enabled) translateAll(); else restoreAll();
+    $('#gtp_user').prop('checked', s.translateUser).on('change', function () {
+        s.translateUser = this.checked; saveSettings();
     });
-    $('#gtd_assistant').prop('checked', s.translateAssistant).on('change', function () {
-        s.translateAssistant = this.checked; save();
-        if (s.enabled) translateAll(); else restoreAll();
+    $('#gtp_assistant').prop('checked', s.translateAssistant).on('change', function () {
+        s.translateAssistant = this.checked; saveSettings();
     });
-    $('#gtd_lang').on('change', function () {
-        s.targetLang = this.value; save();
-        restoreAll();
-        if (s.enabled) translateAll();
+    $('#gtp_lang').on('change', function () {
+        s.targetLang = this.value; saveSettings();
+    });
+    $('#gtp_conc').on('change', function () {
+        s.concurrency = Math.min(10, Math.max(1, parseInt(this.value, 10) || 4));
+        this.value = s.concurrency;
+        saveSettings();
+    });
+    $('#gtp_clear').on('click', function () {
+        clearCache();
+        toastr?.success?.('Translation cache cleared');
     });
 }
 
-// ---------- Hooks ----------
-
 jQuery(() => {
     settings();
+    loadCache();
     buildSettingsPanel();
-
-    const on = (evt, fn) => { if (evt) eventSource.on(evt, fn); };
-
-    on(event_types.CHARACTER_MESSAGE_RENDERED, id => translateById(id));
-    on(event_types.USER_MESSAGE_RENDERED, id => translateById(id));
-    on(event_types.MESSAGE_UPDATED, id => translateById(id));
-    on(event_types.MESSAGE_SWIPED, id => translateById(id));
-    on(event_types.CHAT_CHANGED, () => setTimeout(translateAll, 300));
-    on(event_types.MORE_MESSAGES_LOADED, () => translateAll());
-
-    if (settings().enabled) setTimeout(translateAll, 500);
 });
