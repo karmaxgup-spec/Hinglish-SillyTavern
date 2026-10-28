@@ -1,6 +1,6 @@
 // Built-in Translate (Payload Only) for SillyTavern
 //
-// Uses SillyTavern's own translation function (public/scripts/translate.js) to
+// Uses SillyTavern's built-in translate() (public/scripts/extensions/translate/index.js) to
 // translate the chat history in the outgoing request. The provider is whatever
 // you set in SillyTavern's translation settings, including its keyless Bing option.
 //
@@ -50,9 +50,9 @@ let builtinTranslate = null;
 
 async function getBuiltinTranslate() {
     if (builtinTranslate) return builtinTranslate;
-    const mod = await import('../../../translate.js');
+    const mod = await import('../../translate/index.js');
     if (typeof mod.translate !== 'function') {
-        throw new Error('SillyTavern translate() was not found in translate.js');
+        throw new Error('SillyTavern built-in translate() was not found in extensions/translate/index.js');
     }
     builtinTranslate = mod.translate;
     return builtinTranslate;
