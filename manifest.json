@@ -1,8 +1,8 @@
 {
-  "display_name": "Google Translate (Display Only)",
+  "display_name": "Google Translate (Payload to English)",
   "loading_order": 10,
   "requires": [],
-  "version": "1.0.0",
+  "version": "3.0.0",
   "author": "",
   "js": "index.js",
   "css": "",
