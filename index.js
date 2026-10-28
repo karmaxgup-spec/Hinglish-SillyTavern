@@ -1,4 +1,4 @@
-// Google Translate (Payload to English) for SillyTavern
+// Google Translate / DeepLX (Payload to English) for SillyTavern
 //
 // Translates chat history in the actual request body right before it is sent
 // to the API. The chat on screen, the saved chat file and the stored messages
@@ -8,12 +8,10 @@
 // It wraps window.fetch and, for chat completion requests, parses the JSON body,
 // translates the non-system messages, and sends the modified body on.
 //
-// Accuracy changes in this version:
-//   - Each message is sent whole (one request per message), not cut into
-//     900-character pieces. Long messages are only split if they exceed MAX_CHUNK,
-//     and then only at paragraph or sentence boundaries.
-//   - Requests use POST, so long non-Latin text no longer breaks the URL length.
-//   - Line breaks are kept, so paragraph structure survives translation.
+// Providers:
+//   - google: unofficial Google endpoint (no key)
+//   - deeplx: a DeepLX server you choose. Use a local one (e.g. http://localhost:1188/translate)
+//     or a community instance. Community instances receive your chat text.
 
 import { extension_settings } from '../../../extensions.js';
 
@@ -22,6 +20,8 @@ const CACHE_KEY = 'st_gtranslate_payload_cache';
 
 const DEFAULTS = {
     enabled: true,
+    provider: 'google',           // 'google' | 'deeplx'
+    deeplxUrl: 'http://localhost:1188/translate',
     targetLang: 'en',
     translateUser: true,
     translateAssistant: true,
@@ -91,28 +91,26 @@ function clearCache() {
     localStorage.removeItem(CACHE_KEY);
 }
 
-// ---------- Google Translate (unofficial gtx endpoint, no API key) ----------
+// ---------- splitting (only for messages longer than MAX_CHUNK) ----------
 
-// Splits only when a message is longer than MAX_CHUNK. Prefers paragraph breaks,
-// then line breaks, then sentence ends, so each piece stays a coherent unit.
-// Each piece keeps its trailing separator so joining the results restores the text.
-function splitForGoogle(text) {
+// Prefers paragraph breaks, then line breaks, then sentence ends. Each piece keeps
+// its trailing separator so joining the results restores the original text.
+function splitForTranslation(text) {
     if (text.length <= MAX_CHUNK) return [text];
 
     const parts = [];
     let rest = text;
     while (rest.length > MAX_CHUNK) {
-        const window = rest.slice(0, MAX_CHUNK);
-        let cut = window.lastIndexOf('\n\n');
-        if (cut < MAX_CHUNK / 2) cut = window.lastIndexOf('\n');
+        const win = rest.slice(0, MAX_CHUNK);
+        let cut = win.lastIndexOf('\n\n');
+        if (cut < MAX_CHUNK / 2) cut = win.lastIndexOf('\n');
         if (cut < MAX_CHUNK / 2) {
-            const sentenceEnd = Math.max(window.lastIndexOf('. '), window.lastIndexOf('! '), window.lastIndexOf('? '));
+            const sentenceEnd = Math.max(win.lastIndexOf('. '), win.lastIndexOf('! '), win.lastIndexOf('? '));
             if (sentenceEnd > 0) cut = sentenceEnd + 1;
         }
-        if (cut < MAX_CHUNK / 2) cut = window.lastIndexOf(' ');
-        if (cut < 1) cut = MAX_CHUNK;
-        // Keep the separator at the end of this piece.
-        const end = (window[cut] === '\n' || window[cut] === ' ') ? cut + 1 : cut + 1;
+        if (cut < MAX_CHUNK / 2) cut = win.lastIndexOf(' ');
+        if (cut < 1) cut = MAX_CHUNK - 1;
+        const end = cut + 1;
         parts.push(rest.slice(0, end));
         rest = rest.slice(end);
     }
@@ -120,8 +118,10 @@ function splitForGoogle(text) {
     return parts;
 }
 
-async function translateChunk(text, target) {
-    // POST keeps long text out of the URL, so non-Latin scripts don't hit URL length limits.
+// ---------- providers ----------
+
+// Google: unofficial gtx endpoint. POST keeps long text out of the URL.
+async function googleChunk(text, target) {
     const url = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&dt=t'
         + '&tl=' + encodeURIComponent(target);
     const res = await fetch(url, {
@@ -137,15 +137,38 @@ async function translateChunk(text, target) {
     };
 }
 
+// DeepLX: POST {text, target_lang} to the configured URL. Response: {code, data}.
+// DeepLX target codes are uppercase (EN, ZH, PT-BR...).
+async function deeplxChunk(text, target, url) {
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, target_lang: target.toUpperCase().split('-')[0] }),
+    });
+    if (!res.ok) throw new Error(`DeepLX HTTP ${res.status}`);
+    const data = await res.json();
+    if (typeof data.data !== 'string') throw new Error(`DeepLX bad response: ${JSON.stringify(data).slice(0, 200)}`);
+    return { text: data.data, src: null };
+}
+
+async function providerChunk(text, target, s) {
+    if (s.provider === 'deeplx') {
+        if (!s.deeplxUrl) throw new Error('DeepLX URL is not set');
+        return deeplxChunk(text, target, s.deeplxUrl);
+    }
+    return googleChunk(text, target);
+}
+
 // Returns translated text, or the original if it is already in the target language.
 async function translate(text, target) {
-    const key = target + '\u0000' + text;
+    const s = settings();
+    const key = s.provider + '\u0000' + target + '\u0000' + text;
     if (cache.has(key)) return cache.get(key);
 
     const out = [];
     let detected = null;
-    for (const p of splitForGoogle(text)) {
-        const r = await translateChunk(p, target);
+    for (const p of splitForTranslation(text)) {
+        const r = await providerChunk(p, target, s);
         detected = detected || r.src;
         out.push(r.text);
     }
@@ -214,7 +237,7 @@ async function translateBodyMessages(body) {
         }
     });
 
-    console.log(`[GT payload] ${queued} message segment(s) queued for translation to "${s.targetLang}"`);
+    console.log(`[GT payload] ${queued} segment(s) queued via ${s.provider} to "${s.targetLang}"`);
     if (!queued) return false;
 
     await runPool(tasks, s.concurrency);
@@ -259,13 +282,23 @@ function buildSettingsPanel() {
     const html = `
 <div class="st-gtpayload inline-drawer">
   <div class="inline-drawer-toggle inline-drawer-header">
-    <b>Google Translate (Payload)</b>
+    <b>Translate Payload (Google / DeepLX)</b>
     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
   </div>
   <div class="inline-drawer-content">
     <label class="checkbox_label"><input type="checkbox" id="gtp_enabled"> Enabled</label>
     <label class="checkbox_label"><input type="checkbox" id="gtp_user"> Translate my messages</label>
     <label class="checkbox_label"><input type="checkbox" id="gtp_assistant"> Translate assistant messages</label>
+    <label>Provider
+      <select id="gtp_provider" class="text_pole">
+        <option value="google"${s.provider === 'google' ? ' selected' : ''}>Google (unofficial, no key)</option>
+        <option value="deeplx"${s.provider === 'deeplx' ? ' selected' : ''}>DeepLX</option>
+      </select>
+    </label>
+    <label>DeepLX URL
+      <input type="text" id="gtp_deeplx" class="text_pole" value="${s.deeplxUrl}" placeholder="http://localhost:1188/translate">
+    </label>
+    <small>A community DeepLX URL receives your chat text. Use a local server if your chats are private.</small>
     <label>Send to model in
       <select id="gtp_lang" class="text_pole">${langOptions}</select>
     </label>
@@ -291,6 +324,12 @@ function buildSettingsPanel() {
     });
     $('#gtp_assistant').prop('checked', s.translateAssistant).on('change', function () {
         s.translateAssistant = this.checked; saveSettings();
+    });
+    $('#gtp_provider').on('change', function () {
+        s.provider = this.value; saveSettings();
+    });
+    $('#gtp_deeplx').on('change', function () {
+        s.deeplxUrl = this.value.trim(); saveSettings();
     });
     $('#gtp_lang').on('change', function () {
         s.targetLang = this.value; saveSettings();
