@@ -13,9 +13,11 @@
 //   - deeplx: a DeepLX server you choose. Use a local one (e.g. http://localhost:1188/translate)
 //     or a community instance. Community instances receive your chat text.
 //
-// Rate limiting: DeepL returns HTTP 429 when requests come too fast. Requests to
-// DeepLX are spaced out, and 429 responses are retried with backoff. Failed
-// translations are never cached, so they get retried on the next generation.
+// Rate limiting:
+//   - DeepLX requests are spaced out and run one at a time by default.
+//   - An HTTP 429 pauses ALL translation for a while, not just the one request.
+//   - A message that failed is not retried for FAIL_COOLDOWN_MS, so every new
+//     generation does not resend the same failing requests.
 
 import { extension_settings } from '../../../extensions.js';
 
@@ -29,7 +31,7 @@ const DEFAULTS = {
     targetLang: 'en',
     translateUser: true,
     translateAssistant: true,
-    concurrency: 2,
+    concurrency: 1,
 };
 
 const LANGUAGES = [
@@ -40,11 +42,12 @@ const LANGUAGES = [
     ['bn', 'Bengali'], ['ta', 'Tamil'], ['te', 'Telugu'], ['ur', 'Urdu'],
 ];
 
-const MAX_CHUNK = 4500;       // characters per request; most messages fit in one
-const MAX_CACHE = 5000;       // persisted translation entries
-const DEEPLX_GAP_MS = 800;    // minimum time between DeepLX request starts
-const RETRY_TRIES = 4;        // attempts for a rate-limited request
-const RETRY_START_MS = 1500;  // first backoff delay, doubled each retry
+const MAX_CHUNK = 4500;           // characters per request; most messages fit in one
+const MAX_CACHE = 5000;           // persisted translation entries
+const DEEPLX_GAP_MS = 1500;       // minimum time between DeepLX request starts
+const RETRY_TRIES = 5;            // attempts for a rate-limited request
+const RETRY_START_MS = 3000;      // first backoff delay, doubled each retry
+const FAIL_COOLDOWN_MS = 120000;  // don't retry a failed message for 2 minutes
 
 // ---------- settings ----------
 
@@ -69,6 +72,7 @@ function saveSettings() {
 // ---------- persistent cache ----------
 
 const cache = new Map();
+const failedAt = new Map(); // key -> timestamp of last failure (in memory only)
 
 function loadCache() {
     try {
@@ -95,6 +99,7 @@ function scheduleCacheSave() {
 
 function clearCache() {
     cache.clear();
+    failedAt.clear();
     localStorage.removeItem(CACHE_KEY);
 }
 
@@ -102,26 +107,30 @@ function clearCache() {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// Serializes request starts so there is at least `gapMs` between them.
+// Global pause: set when DeepL returns 429. Every request waits until it passes.
+let pausedUntil = 0;
+
+// Spaces request starts by at least `gapMs`, and respects the global pause.
 let nextSlot = 0;
 async function throttle(gapMs) {
-    if (!gapMs) return;
     const now = Date.now();
-    const start = Math.max(now, nextSlot);
+    const start = Math.max(now, nextSlot, pausedUntil);
     nextSlot = start + gapMs;
     if (start > now) await sleep(start - now);
 }
 
-// Retries on HTTP 429 with exponential backoff. Other errors are thrown immediately.
+class RateLimitError extends Error {}
+
+// Retries on rate limit with exponential backoff. Other errors are thrown immediately.
 async function withRetry(fn) {
     let delay = RETRY_START_MS;
     for (let attempt = 1; ; attempt++) {
         try {
             return await fn();
         } catch (err) {
-            const rateLimited = String(err && err.message).includes('429');
-            if (!rateLimited || attempt >= RETRY_TRIES) throw err;
-            console.warn(`[GT payload] rate limited, retrying in ${delay} ms (attempt ${attempt})`);
+            if (!(err instanceof RateLimitError) || attempt >= RETRY_TRIES) throw err;
+            pausedUntil = Math.max(pausedUntil, Date.now() + delay);
+            console.warn(`[GT payload] DeepL rate limit. Pausing ${delay} ms (attempt ${attempt}).`);
             await sleep(delay);
             delay *= 2;
         }
@@ -166,6 +175,7 @@ async function googleChunk(text, target) {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
         body: 'q=' + encodeURIComponent(text),
     });
+    if (res.status === 429) throw new RateLimitError('Google Translate HTTP 429');
     if (!res.ok) throw new Error(`Google Translate HTTP ${res.status}`);
     const data = await res.json();
     return {
@@ -183,6 +193,7 @@ async function deeplxChunk(text, target, url) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text, target_lang: target.toUpperCase().split('-')[0] }),
     });
+    if (res.status === 429) throw new RateLimitError('DeepLX HTTP 429');
     if (!res.ok) throw new Error(`DeepLX HTTP ${res.status}`);
     const data = await res.json();
     if (typeof data.data !== 'string') throw new Error(`DeepLX bad response: ${JSON.stringify(data).slice(0, 200)}`);
@@ -221,12 +232,21 @@ async function translate(text, target) {
 }
 
 // Translate, but fall back to the original on any error so generation still works.
-// Failures are not cached, so the message is retried next time.
+// A failed message is not retried until FAIL_COOLDOWN_MS has passed.
 async function safeTranslate(text, target) {
+    const s = settings();
+    const key = s.provider + '\u0000' + target + '\u0000' + text;
+
+    if (cache.has(key)) return cache.get(key);
+
+    const last = failedAt.get(key);
+    if (last && Date.now() - last < FAIL_COOLDOWN_MS) return text;
+
     try {
         return await translate(text, target);
     } catch (err) {
-        console.warn('[GT payload] translation failed, using original:', err);
+        failedAt.set(key, Date.now());
+        console.warn('[GT payload] translation failed, using original (retry in 2 min):', err.message || err);
         return text;
     }
 }
@@ -341,7 +361,7 @@ function buildSettingsPanel() {
     <label>Send to model in
       <select id="gtp_lang" class="text_pole">${langOptions}</select>
     </label>
-    <label>Parallel requests (use 1 for DeepLX if you see 429 errors)
+    <label>Parallel requests (keep at 1 for DeepLX)
       <input type="number" id="gtp_conc" class="text_pole" min="1" max="10" value="${s.concurrency}">
     </label>
     <div class="flex-container">
@@ -374,7 +394,7 @@ function buildSettingsPanel() {
         s.targetLang = this.value; saveSettings();
     });
     $('#gtp_conc').on('change', function () {
-        s.concurrency = Math.min(10, Math.max(1, parseInt(this.value, 10) || 2));
+        s.concurrency = Math.min(10, Math.max(1, parseInt(this.value, 10) || 1));
         this.value = s.concurrency;
         saveSettings();
     });
