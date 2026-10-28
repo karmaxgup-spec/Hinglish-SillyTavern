@@ -4,11 +4,13 @@
 // model and every other extension see English. The chat on screen, the saved
 // chat file and the stored messages are never changed.
 //
-// How it works:
-//   manifest.json -> "generate_interceptor": "gtPayloadInterceptor"
-//   SillyTavern calls window.gtPayloadInterceptor(chat, contextSize, abort, type)
-//   before building the prompt. We replace the message objects in that array
-//   with translated copies. We never mutate the original objects.
+// SillyTavern calls window.gtPayloadInterceptor(chat, contextSize, abort, type)
+// before building the prompt. The `chat` array can have three shapes:
+//   - Chat Completion APIs: objects like { role: 'user'|'assistant'|'system', content: string | parts[] }
+//   - Text Completion APIs: plain strings
+//   - Internal message objects: { mes: string, is_user: boolean, is_system: boolean }
+// We handle all three. We replace entries in the array with translated copies
+// and never mutate the original objects.
 
 import { extension_settings } from '../../../extensions.js';
 
@@ -31,8 +33,8 @@ const LANGUAGES = [
     ['bn', 'Bengali'], ['ta', 'Tamil'], ['te', 'Telugu'], ['ur', 'Urdu'],
 ];
 
-const MAX_CHUNK = 900;     // characters per Google request
-const MAX_CACHE = 5000;    // persisted translation entries
+const MAX_CHUNK = 900;   // characters per Google request
+const MAX_CACHE = 5000;  // persisted translation entries
 
 // ---------- settings ----------
 
@@ -54,7 +56,7 @@ function saveSettings() {
     }
 }
 
-// ---------- persistent cache (so restarts do not re-translate old history) ----------
+// ---------- persistent cache ----------
 
 const cache = new Map();
 
@@ -73,7 +75,6 @@ function scheduleCacheSave() {
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
         try {
-            // keep only the newest MAX_CACHE entries (Map keeps insertion order)
             const entries = [...cache.entries()].slice(-MAX_CACHE);
             localStorage.setItem(CACHE_KEY, JSON.stringify(Object.fromEntries(entries)));
         } catch (e) {
@@ -113,30 +114,40 @@ async function translateChunk(text, target) {
     const data = await res.json();
     return {
         text: data[0].map(seg => seg[0]).join(''),
-        src: data[2], // detected source language
+        src: data[2],
     };
 }
 
-// Returns the translated text, or the original if it is already in the target language.
+// Returns translated text, or the original if it is already in the target language.
 async function translate(text, target) {
     const key = target + '\u0000' + text;
     if (cache.has(key)) return cache.get(key);
 
-    const pieces = splitForGoogle(text);
     const out = [];
     let detected = null;
-    for (const p of pieces) {
+    for (const p of splitForGoogle(text)) {
         const r = await translateChunk(p, target);
         detected = detected || r.src;
         out.push(r.text);
     }
 
-    const sameLanguage = detected && detected.toLowerCase().split('-')[0] === target.toLowerCase().split('-')[0];
+    const sameLanguage = detected
+        && detected.toLowerCase().split('-')[0] === target.toLowerCase().split('-')[0];
     const result = sameLanguage ? text : out.join('');
 
     cache.set(key, result);
     scheduleCacheSave();
     return result;
+}
+
+// Translate, but fall back to the original text on any error so generation still works.
+async function safeTranslate(text, target) {
+    try {
+        return await translate(text, target);
+    } catch (err) {
+        console.warn('[GT payload] translation failed, using original:', err);
+        return text;
+    }
 }
 
 // ---------- payload interceptor ----------
@@ -152,39 +163,81 @@ async function runPool(tasks, n) {
     await Promise.all(workers);
 }
 
-// Called by SillyTavern before the prompt is built.
+// Called by SillyTavern before the prompt is built. Mutates the `chat` array
+// in place, replacing entries with translated copies.
 window.gtPayloadInterceptor = async function (chat, contextSize, abort, type) {
     const s = settings();
     if (!s.enabled || !Array.isArray(chat)) return;
 
+    const target = s.targetLang;
     const tasks = [];
+    let queued = 0;
+
     for (let i = 0; i < chat.length; i++) {
         const item = chat[i];
+
+        // Text Completion: plain strings. Role is unknown, so translate if either side is enabled.
+        if (typeof item === 'string') {
+            if (!item.trim() || !(s.translateUser || s.translateAssistant)) continue;
+            queued++;
+            tasks.push(async () => {
+                chat[i] = await safeTranslate(item, target);
+            });
+            continue;
+        }
+
         if (!item || typeof item !== 'object') continue;
-        if (item.is_system) continue;
+        if (item.role === 'system' || item.is_system) continue;
 
-        const isUser = !!item.is_user;
-        if (isUser && !s.translateUser) continue;
-        if (!isUser && !s.translateAssistant) continue;
+        const isUser = item.role === 'user' || item.is_user === true;
+        if (isUser ? !s.translateUser : !s.translateAssistant) continue;
 
-        const field = typeof item.mes === 'string' ? 'mes'
-            : (typeof item.content === 'string' ? 'content' : null);
-        if (!field || !item[field].trim()) continue;
+        // Chat Completion: content is a string.
+        if (typeof item.content === 'string') {
+            if (!item.content.trim()) continue;
+            queued++;
+            tasks.push(async () => {
+                chat[i] = { ...chat[i], content: await safeTranslate(chat[i].content, target) };
+            });
+            continue;
+        }
 
-        tasks.push(async () => {
-            try {
-                const translated = await translate(item[field], s.targetLang);
-                // Replace the entry with a copy. The original message object
-                // (the one stored in the chat) is left untouched.
-                chat[i] = { ...chat[i], [field]: translated };
-            } catch (err) {
-                // On failure keep the original text so generation still works.
-                console.warn('[GT payload] translation failed, using original:', err);
-            }
-        });
+        // Chat Completion: content is an array of parts (text, images, ...). Translate text parts only.
+        if (Array.isArray(item.content)) {
+            const textIdx = [];
+            item.content.forEach((p, pi) => {
+                if (p && p.type === 'text' && typeof p.text === 'string' && p.text.trim()) textIdx.push(pi);
+            });
+            if (!textIdx.length) continue;
+            queued += textIdx.length;
+            tasks.push(async () => {
+                const parts = [...chat[i].content];
+                for (const pi of textIdx) {
+                    parts[pi] = { ...parts[pi], text: await safeTranslate(parts[pi].text, target) };
+                }
+                chat[i] = { ...chat[i], content: parts };
+            });
+            continue;
+        }
+
+        // Internal message objects.
+        if (typeof item.mes === 'string') {
+            if (!item.mes.trim()) continue;
+            queued++;
+            tasks.push(async () => {
+                chat[i] = { ...chat[i], mes: await safeTranslate(chat[i].mes, target) };
+            });
+        }
+    }
+
+    console.log(`[GT payload] ${queued} message segment(s) queued for translation to "${target}" (type: ${type})`);
+    if (!queued) {
+        console.warn('[GT payload] nothing matched. Check the chat payload shape or the user/assistant toggles.');
+        return;
     }
 
     await runPool(tasks, s.concurrency);
+    console.log('[GT payload] done');
 };
 
 // ---------- settings panel ----------
@@ -241,7 +294,7 @@ function buildSettingsPanel() {
     });
     $('#gtp_clear').on('click', function () {
         clearCache();
-        toastr?.success?.('Translation cache cleared');
+        if (window.toastr) window.toastr.success('Translation cache cleared');
     });
 }
 
