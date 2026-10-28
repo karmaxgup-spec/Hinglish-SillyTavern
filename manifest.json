@@ -1,12 +1,10 @@
 {
-    "display_name": "Hinglish Mode",
-    "loading_order": 10,
-    "requires": [],
-    "optional": [],
-    "dependencies": [],
-    "js": "index.js",
-    "author": "you",
-    "version": "1.0.0",
-    "homePage": "",
-    "auto_update": false
+  "display_name": "Google Translate (Display Only)",
+  "loading_order": 10,
+  "requires": [],
+  "version": "1.0.0",
+  "author": "",
+  "js": "index.js",
+  "css": "",
+  "minimum_client_version": "1.12.0"
 }
