@@ -1,4 +1,4 @@
-// Google Translate / DeepLX (Payload to English) for SillyTavern
+// Translate Payload (Google / DeepL / DeepLX) for SillyTavern
 //
 // Translates chat history in the actual request body right before it is sent
 // to the API. The chat on screen, the saved chat file and the stored messages
@@ -9,15 +9,16 @@
 // translates the non-system messages, and sends the modified body on.
 //
 // Providers:
-//   - google: unofficial Google endpoint (no key)
-//   - deeplx: a DeepLX server you choose. Use a local one (e.g. http://localhost:1188/translate)
-//     or a community instance. Community instances receive your chat text.
+//   - google:     unofficial Google endpoint, no key
+//   - google-api: Google Cloud Translation API v2, needs an API key
+//   - deepl-api:  DeepL API, needs an API key (keys ending in ":fx" are free-tier)
+//   - deeplx:     a DeepLX server you choose (local, or a community instance)
+//
+// Keys are stored in SillyTavern's extension settings in plain text.
 //
 // Rate limiting:
-//   - DeepLX requests are spaced out and run one at a time by default.
-//   - An HTTP 429 pauses ALL translation for a while, not just the one request.
-//   - A message that failed is not retried for FAIL_COOLDOWN_MS, so every new
-//     generation does not resend the same failing requests.
+//   - An HTTP 429 pauses ALL translation for a while, with backoff.
+//   - A message that failed is not retried for FAIL_COOLDOWN_MS.
 
 import { extension_settings } from '../../../extensions.js';
 
@@ -26,7 +27,9 @@ const CACHE_KEY = 'st_gtranslate_payload_cache';
 
 const DEFAULTS = {
     enabled: true,
-    provider: 'google',           // 'google' | 'deeplx'
+    provider: 'google',           // 'google' | 'google-api' | 'deepl-api' | 'deeplx'
+    googleApiKey: '',
+    deeplApiKey: '',
     deeplxUrl: 'http://localhost:1188/translate',
     targetLang: 'en',
     translateUser: true,
@@ -42,9 +45,16 @@ const LANGUAGES = [
     ['bn', 'Bengali'], ['ta', 'Tamil'], ['te', 'Telugu'], ['ur', 'Urdu'],
 ];
 
+// Minimum gap between request starts, per provider (ms).
+const PROVIDER_GAP_MS = {
+    'google': 0,
+    'google-api': 0,
+    'deepl-api': 300,
+    'deeplx': 1500,
+};
+
 const MAX_CHUNK = 4500;           // characters per request; most messages fit in one
 const MAX_CACHE = 5000;           // persisted translation entries
-const DEEPLX_GAP_MS = 1500;       // minimum time between DeepLX request starts
 const RETRY_TRIES = 5;            // attempts for a rate-limited request
 const RETRY_START_MS = 3000;      // first backoff delay, doubled each retry
 const FAIL_COOLDOWN_MS = 120000;  // don't retry a failed message for 2 minutes
@@ -107,7 +117,7 @@ function clearCache() {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// Global pause: set when DeepL returns 429. Every request waits until it passes.
+// Global pause: set when a provider returns 429. Every request waits until it passes.
 let pausedUntil = 0;
 
 // Spaces request starts by at least `gapMs`, and respects the global pause.
@@ -130,7 +140,7 @@ async function withRetry(fn) {
         } catch (err) {
             if (!(err instanceof RateLimitError) || attempt >= RETRY_TRIES) throw err;
             pausedUntil = Math.max(pausedUntil, Date.now() + delay);
-            console.warn(`[GT payload] DeepL rate limit. Pausing ${delay} ms (attempt ${attempt}).`);
+            console.warn(`[GT payload] rate limited. Pausing ${delay} ms (attempt ${attempt}).`);
             await sleep(delay);
             delay *= 2;
         }
@@ -164,9 +174,19 @@ function splitForTranslation(text) {
     return parts;
 }
 
-// ---------- providers ----------
+// Reads an error body safely for the console.
+async function errorDetail(res) {
+    try {
+        return (await res.text()).slice(0, 200);
+    } catch {
+        return '';
+    }
+}
 
-// Google: unofficial gtx endpoint. POST keeps long text out of the URL.
+// ---------- providers ----------
+// Each returns { text, src } where src is the detected source language, or null.
+
+// Google (unofficial gtx endpoint, no key). POST keeps long text out of the URL.
 async function googleChunk(text, target) {
     const url = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&dt=t'
         + '&tl=' + encodeURIComponent(target);
@@ -175,8 +195,8 @@ async function googleChunk(text, target) {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
         body: 'q=' + encodeURIComponent(text),
     });
-    if (res.status === 429) throw new RateLimitError('Google Translate HTTP 429');
-    if (!res.ok) throw new Error(`Google Translate HTTP ${res.status}`);
+    if (res.status === 429) throw new RateLimitError('Google HTTP 429');
+    if (!res.ok) throw new Error(`Google HTTP ${res.status}`);
     const data = await res.json();
     return {
         text: data[0].map(seg => seg[0]).join(''),
@@ -184,10 +204,57 @@ async function googleChunk(text, target) {
     };
 }
 
+// Google Cloud Translation API v2. Official, needs an API key.
+async function googleApiChunk(text, target, key) {
+    if (!key) throw new Error('Google API key is not set');
+    const url = 'https://translation.googleapis.com/language/translate/v2?key=' + encodeURIComponent(key);
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ q: text, target, format: 'text' }),
+    });
+    if (res.status === 429) throw new RateLimitError('Google API HTTP 429');
+    if (!res.ok) throw new Error(`Google API HTTP ${res.status}: ${await errorDetail(res)}`);
+    const data = await res.json();
+    const t = data.data.translations[0];
+    return {
+        text: t.translatedText,
+        src: t.detectedSourceLanguage || null,
+    };
+}
+
+// DeepL API. Free-tier keys end in ":fx" and use api-free.deepl.com.
+// Target codes: EN and PT must be regional, Chinese uses ZH-HANS/ZH-HANT.
+function deeplTargetCode(lang) {
+    const map = { en: 'EN-US', pt: 'PT-BR', 'zh-CN': 'ZH-HANS', zh: 'ZH-HANS' };
+    return map[lang] || lang.toUpperCase();
+}
+
+async function deeplApiChunk(text, target, key) {
+    if (!key) throw new Error('DeepL API key is not set');
+    const host = key.endsWith(':fx') ? 'api-free.deepl.com' : 'api.deepl.com';
+    const res = await fetch(`https://${host}/v2/translate`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'DeepL-Auth-Key ' + key,
+        },
+        body: JSON.stringify({ text: [text], target_lang: deeplTargetCode(target) }),
+    });
+    if (res.status === 429) throw new RateLimitError('DeepL API HTTP 429');
+    if (res.status === 456) throw new Error('DeepL quota exceeded for this key');
+    if (!res.ok) throw new Error(`DeepL API HTTP ${res.status}: ${await errorDetail(res)}`);
+    const data = await res.json();
+    const t = data.translations[0];
+    return {
+        text: t.text,
+        src: t.detected_source_language ? t.detected_source_language.toLowerCase() : null,
+    };
+}
+
 // DeepLX: POST {text, target_lang} to the configured URL. Response: {code, data}.
-// DeepLX target codes are uppercase (EN, ZH, PT-BR...).
 async function deeplxChunk(text, target, url) {
-    await throttle(DEEPLX_GAP_MS);
+    if (!url) throw new Error('DeepLX URL is not set');
     const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -201,11 +268,16 @@ async function deeplxChunk(text, target, url) {
 }
 
 async function providerChunk(text, target, s) {
-    if (s.provider === 'deeplx') {
-        if (!s.deeplxUrl) throw new Error('DeepLX URL is not set');
-        return withRetry(() => deeplxChunk(text, target, s.deeplxUrl));
-    }
-    return withRetry(() => googleChunk(text, target));
+    const gap = PROVIDER_GAP_MS[s.provider] ?? 0;
+    return withRetry(async () => {
+        await throttle(gap);
+        switch (s.provider) {
+            case 'google-api': return googleApiChunk(text, target, s.googleApiKey);
+            case 'deepl-api':  return deeplApiChunk(text, target, s.deeplApiKey);
+            case 'deeplx':     return deeplxChunk(text, target, s.deeplxUrl);
+            default:           return googleChunk(text, target);
+        }
+    });
 }
 
 // Returns translated text, or the original if it is already in the target language.
@@ -337,11 +409,17 @@ function buildSettingsPanel() {
     const langOptions = LANGUAGES
         .map(([code, name]) => `<option value="${code}"${code === s.targetLang ? ' selected' : ''}>${name}</option>`)
         .join('');
+    const providerOptions = [
+        ['google', 'Google (unofficial, no key)'],
+        ['google-api', 'Google Cloud Translation API (key)'],
+        ['deepl-api', 'DeepL API (key)'],
+        ['deeplx', 'DeepLX (URL)'],
+    ].map(([v, label]) => `<option value="${v}"${v === s.provider ? ' selected' : ''}>${label}</option>`).join('');
 
     const html = `
 <div class="st-gtpayload inline-drawer">
   <div class="inline-drawer-toggle inline-drawer-header">
-    <b>Translate Payload (Google / DeepLX)</b>
+    <b>Translate Payload (Google / DeepL)</b>
     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
   </div>
   <div class="inline-drawer-content">
@@ -349,15 +427,18 @@ function buildSettingsPanel() {
     <label class="checkbox_label"><input type="checkbox" id="gtp_user"> Translate my messages</label>
     <label class="checkbox_label"><input type="checkbox" id="gtp_assistant"> Translate assistant messages</label>
     <label>Provider
-      <select id="gtp_provider" class="text_pole">
-        <option value="google"${s.provider === 'google' ? ' selected' : ''}>Google (unofficial, no key)</option>
-        <option value="deeplx"${s.provider === 'deeplx' ? ' selected' : ''}>DeepLX</option>
-      </select>
+      <select id="gtp_provider" class="text_pole">${providerOptions}</select>
+    </label>
+    <label>Google Cloud API key
+      <input type="password" id="gtp_gkey" class="text_pole" value="${s.googleApiKey}" autocomplete="off">
+    </label>
+    <label>DeepL API key (free keys end in :fx)
+      <input type="password" id="gtp_dkey" class="text_pole" value="${s.deeplApiKey}" autocomplete="off">
     </label>
     <label>DeepLX URL
       <input type="text" id="gtp_deeplx" class="text_pole" value="${s.deeplxUrl}" placeholder="http://localhost:1188/translate">
     </label>
-    <small>A community DeepLX URL receives your chat text. Use a local server if your chats are private.</small>
+    <small>Keys are saved in SillyTavern's settings in plain text. Community DeepLX URLs receive your chat text.</small>
     <label>Send to model in
       <select id="gtp_lang" class="text_pole">${langOptions}</select>
     </label>
@@ -386,6 +467,12 @@ function buildSettingsPanel() {
     });
     $('#gtp_provider').on('change', function () {
         s.provider = this.value; saveSettings();
+    });
+    $('#gtp_gkey').on('change', function () {
+        s.googleApiKey = this.value.trim(); saveSettings();
+    });
+    $('#gtp_dkey').on('change', function () {
+        s.deeplApiKey = this.value.trim(); saveSettings();
     });
     $('#gtp_deeplx').on('change', function () {
         s.deeplxUrl = this.value.trim(); saveSettings();
