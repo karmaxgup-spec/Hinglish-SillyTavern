@@ -1,51 +1,224 @@
-import { eventSource, event_types } from '../../../../script.js';
-import { getContext } from '../../../extensions.js';
+// Built-in Translate (Payload Only) for SillyTavern
+//
+// Uses SillyTavern's own translation function (public/scripts/translate.js) to
+// translate the chat history in the outgoing request. The provider is whatever
+// you set in SillyTavern's translation settings, including its keyless Bing option.
+//
+// The chat on screen, the saved chat and the stored messages are never changed.
+// Only the copy of the request that goes to the API is rewritten.
+//
+// This extension does not add a translation provider or call any translation
+// service directly. It relies on the built-in function and falls back to the
+// original text if that function is missing or fails.
 
-const MODULE = 'st_outgoing_translate';
-const TARGET_LANG = 'en';
-const SOURCE_LANG = 'auto';
-const EXTRA_KEY = 'outgoing_translation';
+import { extension_settings } from '../../../extensions.js';
+
+const MODULE = 'st_builtin_translate_payload';
+
+const DEFAULTS = {
+    enabled: true,
+    targetLang: 'en',
+    translateUser: true,
+    translateAssistant: true,
+    concurrency: 2,
+};
+
+const FAIL_COOLDOWN_MS = 120000; // don't retry a failed message for 2 minutes
+const MAX_CACHE = 2000;
+
+function settings() {
+    if (!extension_settings[MODULE]) {
+        extension_settings[MODULE] = structuredClone(DEFAULTS);
+    }
+    for (const k of Object.keys(DEFAULTS)) {
+        if (extension_settings[MODULE][k] === undefined) {
+            extension_settings[MODULE][k] = DEFAULTS[k];
+        }
+    }
+    return extension_settings[MODULE];
+}
+
+function saveSettings() {
+    if (typeof window.saveSettingsDebounced === 'function') {
+        window.saveSettingsDebounced();
+    }
+}
+
+// ---------- SillyTavern's built-in translate ----------
+
+let builtinTranslate = null;
+
+async function getBuiltinTranslate() {
+    if (builtinTranslate) return builtinTranslate;
+    const mod = await import('../../../translate.js');
+    if (typeof mod.translate !== 'function') {
+        throw new Error('SillyTavern translate() was not found in translate.js');
+    }
+    builtinTranslate = mod.translate;
+    return builtinTranslate;
+}
+
+// ---------- cache and failure cooldown ----------
 
 const cache = new Map();
+const failedAt = new Map();
 
-async function translateText(text) {
-    if (!text || !text.trim()) return text;
-    const key = `${SOURCE_LANG}|${TARGET_LANG}|${text}`;
+function cacheKey(text, lang) {
+    return lang + '\u0000' + text;
+}
+
+function remember(key, value) {
+    cache.set(key, value);
+    if (cache.size > MAX_CACHE) cache.delete(cache.keys().next().value);
+}
+
+// Returns the translated text, or the original on any failure.
+async function safeTranslate(text, lang) {
+    const key = cacheKey(text, lang);
     if (cache.has(key)) return cache.get(key);
 
-    const url = 'https://translate.googleapis.com/translate_a/single'
-        + `?client=gtx&sl=${SOURCE_LANG}&tl=${TARGET_LANG}&dt=t&q=${encodeURIComponent(text)}`;
+    const last = failedAt.get(key);
+    if (last && Date.now() - last < FAIL_COOLDOWN_MS) return text;
+
     try {
-        const res = await fetch(url);
-        const data = await res.json();
-        const translated = data[0].map(seg => seg[0]).join('');
-        cache.set(key, translated);
-        return translated;
+        const translate = await getBuiltinTranslate();
+        const result = await translate(text, lang);
+        if (typeof result !== 'string' || !result.trim()) throw new Error('empty translation');
+        remember(key, result);
+        return result;
     } catch (err) {
-        console.error(`[${MODULE}] translation failed, using original`, err);
+        failedAt.set(key, Date.now());
+        console.warn('[ST built-in payload] translation failed, using original (retry in 2 min):', err.message || err);
         return text;
     }
 }
 
-// Translate the user's message as soon as it's sent. The result is stored in
-// msg.extra, never in msg.mes, so the displayed text is never changed.
-eventSource.on(event_types.MESSAGE_SENT, async (index) => {
-    const { chat } = getContext();
-    const msg = chat[index];
-    if (!msg || !msg.is_user) return;
-    msg.extra = msg.extra || {};
-    msg.extra[EXTRA_KEY] = await translateText(msg.mes);
-});
+// ---------- request body rewriting ----------
 
-// Runs right before the prompt is built. Swaps in the translation on copies only.
-globalThis.outgoingTranslateInterceptor = async function (chat, contextSize, abort, type) {
-    for (let i = chat.length - 1; i >= 0; i--) {
-        const msg = chat[i];
-        if (!msg || !msg.is_user) continue;
+async function runPool(tasks, n) {
+    let next = 0;
+    const workers = Array.from({ length: Math.max(1, n) }, async () => {
+        while (next < tasks.length) {
+            const task = tasks[next++];
+            await task();
+        }
+    });
+    await Promise.all(workers);
+}
 
-        // Use the stored translation if it exists, otherwise translate now.
-        const translated = msg.extra?.[EXTRA_KEY] ?? await translateText(msg.mes);
-        chat[i] = { ...msg, mes: translated };
-        break;
+// Translates messages in our own parsed copy of the request body.
+async function translateBodyMessages(body) {
+    const s = settings();
+    const messages = body.messages;
+    const tasks = [];
+    let queued = 0;
+
+    messages.forEach((m, i) => {
+        if (!m || typeof m !== 'object') return;
+        if (m.role === 'system') return;
+        const isUser = m.role === 'user';
+        if (isUser ? !s.translateUser : !s.translateAssistant) return;
+
+        if (typeof m.content === 'string') {
+            if (!m.content.trim()) return;
+            queued++;
+            tasks.push(async () => {
+                messages[i].content = await safeTranslate(m.content, s.targetLang);
+            });
+        } else if (Array.isArray(m.content)) {
+            m.content.forEach((part, pi) => {
+                if (part && part.type === 'text' && typeof part.text === 'string' && part.text.trim()) {
+                    queued++;
+                    tasks.push(async () => {
+                        messages[i].content[pi].text = await safeTranslate(part.text, s.targetLang);
+                    });
+                }
+            });
+        }
+    });
+
+    console.log(`[ST built-in payload] ${queued} segment(s) queued for "${s.targetLang}"`);
+    if (!queued) return false;
+
+    await runPool(tasks, s.concurrency);
+    return true;
+}
+
+function isChatCompletionUrl(url) {
+    return url.includes('/chat-completions/generate') || url.includes('/chat/completions');
+}
+
+// Wrap fetch so chat completion requests carry translated messages.
+const originalFetch = window.fetch.bind(window);
+
+window.fetch = async function (input, init) {
+    try {
+        const url = typeof input === 'string' ? input : (input && input.url) || '';
+        const s = settings();
+        if (s.enabled && init && typeof init.body === 'string' && isChatCompletionUrl(url)) {
+            const body = JSON.parse(init.body);
+            if (body && Array.isArray(body.messages)) {
+                const changed = await translateBodyMessages(body);
+                if (changed) {
+                    init = { ...init, body: JSON.stringify(body) };
+                    console.log('[ST built-in payload] request body rewritten');
+                }
+            }
+        }
+    } catch (err) {
+        console.warn('[ST built-in payload] could not rewrite request, sending original:', err);
     }
+    return originalFetch(input, init);
 };
+
+// ---------- settings panel ----------
+
+function buildSettingsPanel() {
+    const s = settings();
+    const html = `
+<div class="st-builtin-payload inline-drawer">
+  <div class="inline-drawer-toggle inline-drawer-header">
+    <b>Built-in Translate (Payload Only)</b>
+    <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+  </div>
+  <div class="inline-drawer-content">
+    <label class="checkbox_label"><input type="checkbox" id="stbp_enabled"> Enabled</label>
+    <label class="checkbox_label"><input type="checkbox" id="stbp_user"> Translate my messages</label>
+    <label class="checkbox_label"><input type="checkbox" id="stbp_assistant"> Translate assistant messages</label>
+    <label>Target language code
+      <input type="text" id="stbp_lang" class="text_pole" value="${s.targetLang}" placeholder="en">
+    </label>
+    <label>Parallel requests
+      <input type="number" id="stbp_conc" class="text_pole" min="1" max="10" value="${s.concurrency}">
+    </label>
+    <small>Uses the provider set in SillyTavern's translation settings. Changes only the request sent to the model. The chat on screen and saved chats keep their original text.</small>
+  </div>
+</div>`;
+
+    const container = document.getElementById('extensions_settings') || document.body;
+    container.insertAdjacentHTML('beforeend', html);
+
+    const $ = window.jQuery;
+    $('#stbp_enabled').prop('checked', s.enabled).on('change', function () {
+        s.enabled = this.checked; saveSettings();
+    });
+    $('#stbp_user').prop('checked', s.translateUser).on('change', function () {
+        s.translateUser = this.checked; saveSettings();
+    });
+    $('#stbp_assistant').prop('checked', s.translateAssistant).on('change', function () {
+        s.translateAssistant = this.checked; saveSettings();
+    });
+    $('#stbp_lang').on('change', function () {
+        s.targetLang = this.value.trim() || 'en'; saveSettings();
+    });
+    $('#stbp_conc').on('change', function () {
+        s.concurrency = Math.min(10, Math.max(1, parseInt(this.value, 10) || 2));
+        this.value = s.concurrency;
+        saveSettings();
+    });
+}
+
+jQuery(() => {
+    settings();
+    buildSettingsPanel();
+});
